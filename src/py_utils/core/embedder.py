@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
+import threading
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence, TypeVar
 
 import numpy as np
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -58,6 +60,14 @@ _MAX_SEQ_LEN = 2048
 _embedder: Optional[SentenceTransformer] = None
 _reranker: Optional[CrossEncoder] = None
 _models_dir: Optional[Path] = None
+
+# Первые вызовы приходят из пула потоков сайдкара разом: без замка каждый
+# грузил свою копию модели (по гигабайту с лишним) и сохранял её в тот же
+# каталог одновременно с соседом.
+_embedder_lock = threading.Lock()
+_reranker_lock = threading.Lock()
+
+_Model = TypeVar("_Model")
 
 
 def _embed_model_id() -> str:
@@ -115,17 +125,7 @@ def _detect_device() -> str:
     return "cpu"
 
 
-def get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is not None:
-        return _embedder
-
-    cache_dir = _models_dir or (Path.home() / ".py-utils" / "models")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    model_id = _embed_model_id()
-    local_path = cache_dir / _model_dir_name(model_id)
-    device = _detect_device()
-
+def _model_kwargs(device: str) -> dict:
     # bf16 on CUDA halves activation memory; quality difference for
     # similarity scoring is below noise floor.
     model_kwargs = {}
@@ -135,23 +135,69 @@ def get_embedder() -> SentenceTransformer:
             model_kwargs["torch_dtype"] = torch.bfloat16
         except Exception:
             pass
+    return model_kwargs
+
+
+def _load_cached_model(
+    label: str,
+    model_id: str,
+    load: Callable[..., _Model],
+    save: Callable[[_Model, str], None],
+) -> _Model:
+    """Модель из локального кэша, иначе скачать и сохранить в кэш.
+
+    Сохранение атомарное: сначала во временный каталог, потом переименование.
+    Раньше модель писалась прямо в кэш, и прерванная запись (закрыли
+    приложение, кончилось место) оставляла каталог, который существует, —
+    дальше каждый запуск пытался грузить из него и падал, а скачать заново
+    было уже нечему: проверка смотрела только на существование.
+    """
+    cache_dir = _models_dir or (Path.home() / ".py-utils" / "models")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_path = cache_dir / _model_dir_name(model_id)
+    device = _detect_device()
+    kwargs = {"device": device, "model_kwargs": _model_kwargs(device)}
 
     if local_path.exists():
-        logger.info("Loading embedder %s from cache: %s (device=%s)", model_id, local_path, device)
-        _embedder = SentenceTransformer(str(local_path), device=device, model_kwargs=model_kwargs)
-    else:
-        logger.info("Downloading embedder %s → %s (device=%s)", model_id, local_path, device)
-        _embedder = SentenceTransformer(
-            model_id, cache_folder=str(cache_dir), device=device, model_kwargs=model_kwargs,
-        )
-        _embedder.save(str(local_path))
+        try:
+            logger.info("Loading %s %s from cache: %s (device=%s)", label, model_id, local_path, device)
+            return load(str(local_path), **kwargs)
+        except Exception as exc:
+            logger.warning("%s cache %s is unreadable (%s) — downloading again", label, local_path, exc)
 
-    # Cap the sequence length to keep activation memory bounded; our chunks
-    # never exceed this in practice.
-    if hasattr(_embedder, "max_seq_length") and _embedder.max_seq_length > _MAX_SEQ_LEN:
-        logger.info("Capping max_seq_length %d → %d", _embedder.max_seq_length, _MAX_SEQ_LEN)
-        _embedder.max_seq_length = _MAX_SEQ_LEN
-    return _embedder
+    logger.info("Downloading %s %s → %s (device=%s)", label, model_id, local_path, device)
+    model = load(model_id, cache_folder=str(cache_dir), **kwargs)
+    staging = local_path.with_name(f"{local_path.name}.partial-{os.getpid()}")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        save(model, str(staging))
+        shutil.rmtree(local_path, ignore_errors=True)
+        os.replace(staging, local_path)
+    except OSError as exc:
+        # Модель уже в памяти — без локальной копии в следующий раз она
+        # просто скачается снова.
+        logger.warning("Could not cache %s at %s: %s", label, local_path, exc)
+        shutil.rmtree(staging, ignore_errors=True)
+    return model
+
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is not None:
+        return _embedder
+    with _embedder_lock:
+        if _embedder is not None:
+            return _embedder
+        embedder = _load_cached_model(
+            "embedder", _embed_model_id(), SentenceTransformer, lambda model, path: model.save(path),
+        )
+        # Cap the sequence length to keep activation memory bounded; our chunks
+        # never exceed this in practice.
+        if hasattr(embedder, "max_seq_length") and embedder.max_seq_length > _MAX_SEQ_LEN:
+            logger.info("Capping max_seq_length %d → %d", embedder.max_seq_length, _MAX_SEQ_LEN)
+            embedder.max_seq_length = _MAX_SEQ_LEN
+        _embedder = embedder
+        return _embedder
 
 
 def _param_bucket_for_active_model() -> str:
@@ -209,30 +255,16 @@ def get_reranker() -> CrossEncoder:
     global _reranker
     if _reranker is not None:
         return _reranker
-    cache_dir = _models_dir or (Path.home() / ".py-utils" / "models")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    model_id = _reranker_model_id()
-    local_path = cache_dir / _model_dir_name(model_id)
-    device = _detect_device()
-
-    model_kwargs = {}
-    if device == "cuda":
-        try:
-            import torch
-            model_kwargs["torch_dtype"] = torch.bfloat16
-        except Exception:
-            pass
-
-    if local_path.exists():
-        logger.info("Loading reranker %s from cache: %s (device=%s)", model_id, local_path, device)
-        _reranker = CrossEncoder(str(local_path), device=device, model_kwargs=model_kwargs)
-    else:
-        logger.info("Downloading reranker %s → %s (device=%s)", model_id, local_path, device)
-        _reranker = CrossEncoder(model_id, cache_folder=str(cache_dir), device=device, model_kwargs=model_kwargs)
-        _reranker.save_pretrained(str(local_path))
-    if hasattr(_reranker, "max_length") and _reranker.max_length and _reranker.max_length > _MAX_SEQ_LEN:
-        _reranker.max_length = _MAX_SEQ_LEN
-    return _reranker
+    with _reranker_lock:
+        if _reranker is not None:
+            return _reranker
+        reranker = _load_cached_model(
+            "reranker", _reranker_model_id(), CrossEncoder, lambda model, path: model.save_pretrained(path),
+        )
+        if hasattr(reranker, "max_length") and reranker.max_length and reranker.max_length > _MAX_SEQ_LEN:
+            reranker.max_length = _MAX_SEQ_LEN
+        _reranker = reranker
+        return _reranker
 
 
 def rerank(query: str, candidates: Sequence[str], top_k: Optional[int] = None) -> list[tuple[int, float]]:

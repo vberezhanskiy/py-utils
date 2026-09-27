@@ -42,7 +42,15 @@ class MultiLangCodeRetriever:
         cache_dir: Path,
         chunk_size: int = 60,
         overlap: int = 15,
+        build_if_missing: bool = True,
     ) -> None:
+        """``build_if_missing=False`` — только загрузить готовый индекс.
+
+        Сборка на CPU идёт часами; поиск в запросе её запускать не должен,
+        и между проверкой «кэш есть» и конструктором файлы успевали
+        поменяться — конструктор уходил в полную сборку. Без индекса
+        ``cache_key`` остаётся None, и вызывающий ищет другим путём.
+        """
         self.root_dir = Path(root_dir).resolve()
         self.chunk_size = chunk_size
         self.overlap = overlap
@@ -52,6 +60,9 @@ class MultiLangCodeRetriever:
         self.chunks: List[str] = []
         self.file_paths: List[str] = []
         self.line_numbers: List[int] = []
+        # Ключ состояния файлов, на котором построен индекс в памяти; None —
+        # индекса нет. По нему is_current() видит правки после загрузки.
+        self.cache_key: Optional[str] = None
         self._gitignore_parser = None
         gitignore_path = self.root_dir / ".gitignore"
         if gitignore_path.exists():
@@ -59,7 +70,7 @@ class MultiLangCodeRetriever:
                 self._gitignore_parser = gitignore_parser.parse_gitignore(gitignore_path)
             except Exception:
                 pass
-        self._load_or_build_index()
+        self._load_or_build_index(build_if_missing)
 
     @staticmethod
     def _tokenize_text(text: str) -> List[str]:
@@ -146,8 +157,12 @@ class MultiLangCodeRetriever:
                 files.append(path)
         return sorted(files)
 
-    def _build_index(self) -> None:
+    def _build_index(self, cache_key: Optional[str] = None) -> None:
         import time
+        # Ключ — ДО чтения файлов: сборка идёт долго, и правка посреди неё
+        # попадала в ключ, но не в индекс. Такой индекс считался свежим, пока
+        # файл не поменяют ещё раз.
+        cache_key = cache_key or self._get_cache_key()
         t0 = time.time()
         logger.info("Building hybrid index for %s", self.root_dir)
 
@@ -206,6 +221,7 @@ class MultiLangCodeRetriever:
             self.chunks = []
             self.file_paths = []
             self.line_numbers = []
+            self.cache_key = cache_key
             return
 
         self.bm25 = BM25Okapi(tokenized_corpus)
@@ -225,7 +241,7 @@ class MultiLangCodeRetriever:
         self.file_paths = file_paths
         self.line_numbers = line_numbers
 
-        cache_key = self._get_cache_key()
+        self.cache_key = cache_key
         self.cache[cache_key] = {
             "bm25": self.bm25,
             "faiss_index": faiss.serialize_index(self.faiss_index),
@@ -235,7 +251,7 @@ class MultiLangCodeRetriever:
         }
         logger.info("Index built and cached (%d chunks)", len(self.chunks))
 
-    def _load_or_build_index(self) -> None:
+    def _load_or_build_index(self, build_if_missing: bool = True) -> None:
         cache_key = self._get_cache_key()
         if cache_key in self.cache:
             logger.info("Loading retriever index from cache")
@@ -245,9 +261,18 @@ class MultiLangCodeRetriever:
             self.chunks = data["chunks"]
             self.file_paths = data["file_paths"]
             self.line_numbers = data.get("line_numbers", [0] * len(self.chunks))
-        else:
+            self.cache_key = cache_key
+        elif build_if_missing:
             self._evict_old_cache(cache_key)
-            self._build_index()
+            self._build_index(cache_key)
+
+    def is_current(self) -> bool:
+        """Совпадает ли индекс в памяти с файлами на диске.
+
+        Загруженный индекс не замечал правок: поиск возвращал куски удалённых
+        файлов и старые номера строк, пока процесс не перезапустят.
+        """
+        return self.cache_key is not None and self._get_cache_key() == self.cache_key
 
     def _evict_old_cache(self, current_key: str) -> None:
         stale_keys = [k for k in self.cache if k != current_key]
@@ -282,6 +307,7 @@ class MultiLangCodeRetriever:
     def rebuild(self) -> None:
         """Drop the cache and rebuild from scratch."""
         self.cache.clear()
+        self.cache_key = None
         self._build_index()
 
     @staticmethod

@@ -462,8 +462,24 @@ _TRAIT_PATTERNS_UNIVERSAL: list[tuple[str, re.Pattern]] = [
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """``with`` завершает транзакцию И закрывает соединение.
+
+    У обычного sqlite3.Connection выход из ``with`` только фиксирует или
+    откатывает транзакцию, а соединение остаётся открытым до сборщика мусора.
+    Сайдкар живёт всё время работы приложения, и каждый запрос к графу
+    оставлял за собой открытый файл базы и WAL.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def _connect(db_path) -> sqlite3.Connection:
-    """Соединение с графом.
+    """Соединение с графом; ``with _connect(...)`` закрывает его на выходе.
 
     WAL и busy_timeout не выставлялись нигде, поэтому действовал
     rollback-journal и пятисекундное ожидание: полная пересборка делает VACUUM
@@ -471,7 +487,7 @@ def _connect(db_path) -> sqlite3.Connection:
     «database is locked» — интерфейс получал голый 500, а записи билдера
     возвращали модели ошибку, и файл молча оставался неиндексированным.
     """
-    con = sqlite3.connect(db_path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
+    con = sqlite3.connect(db_path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000, factory=_ClosingConnection)
     con.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
     try:
         con.execute("PRAGMA journal_mode=WAL")
