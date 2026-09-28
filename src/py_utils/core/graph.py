@@ -22,7 +22,7 @@ import tomllib
 from pathlib import Path
 from typing import Optional
 
-import gitignore_parser
+from ..ignore import ProjectIgnore
 import json5
 
 from .embedder import encode_batch_size, encode_documents, encode_query
@@ -556,13 +556,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         self._extra_extensions: list[str] = list(project_config.extra_extensions or [])
         self._max_file_bytes: int = project_config.max_file_bytes or _MAX_FILE_BYTES
 
-        self._gitignore_parser = None
-        gitignore_path = self.project_root / ".gitignore"
-        if gitignore_path.exists():
-            try:
-                self._gitignore_parser = gitignore_parser.parse_gitignore(gitignore_path)
-            except Exception:
-                pass
+        self._gitignore_parser = ProjectIgnore(self.project_root)
 
     @property
     def is_building(self) -> bool:
@@ -2395,6 +2389,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return [{"file": r[0], "caller": r[1]} for r in rows]
 
     def get_file_entities(self, rel_path: str) -> list[dict]:
+        if self._should_ignore(self.project_root / rel_path):
+            return []
         with _connect(self.db_path) as con:
             rows = con.execute(
                 "SELECT name, type, description, line_start, line_end, snippet FROM entities "
@@ -2417,6 +2413,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return location
 
     def format_entity_result(self, entity: dict, include_snippet: bool = True, indent: str = "  • ") -> list[str]:
+        if entity.get("file") and self._should_ignore(self.project_root / entity["file"]):
+            return []
         desc = f": {entity['description']}" if entity.get("description") else ""
         lines = [f"{indent}[{entity['type']}] {entity['name']}{desc}  ({self.format_entity_location(entity)})"]
         if include_snippet and entity.get("snippet"):
@@ -2517,7 +2515,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                     return results
         return results
 
-    def search_entity(self, query: str, entity_type: Optional[str] = None, limit: int = 10) -> list[dict]:
+    def search_entity(self, query: str, entity_type: Optional[str] = None, limit: int = 10, *, _semantic_fallback: bool = True) -> list[dict]:
         # Semantic re-ranking / fallback below needs the FAISS index, which
         # is process-local — build it lazily so a fresh process doesn't
         # silently degrade to LIKE-only search.
@@ -2600,6 +2598,8 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 rows = con.execute(sql, params).fetchall()
         results = []
         for r in rows:
+            if self._should_ignore(self.project_root / r[0]):
+                continue
             line_start = r[4]
             line_end = r[5]
             snippet = r[6] or ""
@@ -2638,7 +2638,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # LIKE found nothing — try FAISS-only as a fallback for natural-language
         # queries that don't match any entity name (e.g. Russian questions).
         faiss_index, faiss_index_names = self.faiss_pair
-        if faiss_index is not None and faiss_index_names:
+        if _semantic_fallback and faiss_index is not None and faiss_index_names:
             try:
                 q_vec = encode_query([query], normalize_embeddings=True,
                                      show_progress_bar=False).astype("float32")
@@ -2647,7 +2647,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 faiss_names = [faiss_index_names[i] for s, i in zip(scores[0], indices[0])
                                if i >= 0 and s > 0.1][:limit]
                 if faiss_names:
-                    results = self.search_entity(" ".join(faiss_names), entity_type=entity_type, limit=limit)
+                    results = self.search_entity(" ".join(faiss_names), entity_type=entity_type, limit=limit, _semantic_fallback=False)
                     if results:
                         return results
             except Exception as e:

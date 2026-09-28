@@ -20,7 +20,7 @@ from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 
 from ..paths import is_inside_project, is_secret_file
-import gitignore_parser
+from ..ignore import ProjectIgnore
 
 from .embedder import (
     _embed_model_id,
@@ -63,13 +63,7 @@ class MultiLangCodeRetriever:
         # Ключ состояния файлов, на котором построен индекс в памяти; None —
         # индекса нет. По нему is_current() видит правки после загрузки.
         self.cache_key: Optional[str] = None
-        self._gitignore_parser = None
-        gitignore_path = self.root_dir / ".gitignore"
-        if gitignore_path.exists():
-            try:
-                self._gitignore_parser = gitignore_parser.parse_gitignore(gitignore_path)
-            except Exception:
-                pass
+        self._gitignore_parser = ProjectIgnore(self.root_dir)
         self._load_or_build_index(build_if_missing)
 
     @staticmethod
@@ -129,7 +123,7 @@ class MultiLangCodeRetriever:
         exts = {ext.lstrip("*").lower() for ext in self._code_extensions()}
 
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
-            dirnames[:] = [d for d in dirnames if not self._should_ignore_dir(d)]
+            dirnames[:] = sorted(d for d in dirnames if not self._should_ignore_dir(d))
             for fname in filenames:
                 fname_lower = fname.lower()
                 if not any(fname_lower.endswith(ext) for ext in exts):
@@ -282,12 +276,18 @@ class MultiLangCodeRetriever:
             logger.info("Evicted %d stale cache entries", len(stale_keys))
 
     def _get_cache_key(self) -> str:
-        h = hashlib.md5()
+        h = hashlib.md5(b"nested-ignore-v2")
         exts = {ext.lstrip("*").lower() for ext in self._code_extensions()}
         for dirpath, dirnames, filenames in os.walk(self.root_dir):
-            dirnames[:] = [d for d in dirnames if not self._should_ignore_dir(d)]
-            for fname in filenames:
+            dirnames[:] = sorted(d for d in dirnames if not self._should_ignore_dir(d))
+            for fname in sorted(filenames):
                 fpath = os.path.join(dirpath, fname)
+                if fname == ".gitignore":
+                    try:
+                        h.update(os.path.relpath(fpath, self.root_dir).encode())
+                        h.update(Path(fpath).read_bytes() if is_inside_project(self.root_dir, fpath) else b"outside")
+                    except OSError:
+                        h.update(b"unreadable")
                 if not any(fname.lower().endswith(ext) for ext in exts):
                     continue
                 if self._should_ignore(Path(fpath)):
@@ -383,6 +383,9 @@ class MultiLangCodeRetriever:
         candidates: Dict[int, Tuple[str, str, int, float]] = {}
         all_ids = set(int(i) for i in bm25_top) | set(dense_score_map.keys()) | literal_hits
         for idx in all_ids:
+            file = self.root_dir / self.file_paths[idx]
+            if self._should_ignore(file) or not is_inside_project(self.root_dir, file) or is_secret_file(file.name):
+                continue
             bm25_norm = bm25_scores[idx] / max_bm25 if idx < len(bm25_scores) else 0.0
             dense_norm = dense_score_map.get(idx, 0.0)
             combined = 0.5 * bm25_norm + 0.5 * dense_norm

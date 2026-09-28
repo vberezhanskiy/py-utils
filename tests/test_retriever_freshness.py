@@ -86,3 +86,16 @@ def test_готовый_индекс_загружается_с_ключом(retr
     loaded = retriever_module.MultiLangCodeRetriever(project, tmp_path / "cache", build_if_missing=False)
     assert loaded.cache_key == key
     assert loaded.chunks, "индекс из кэша пустой"
+
+
+def test_ignore_change_invalidates_cache_and_filters_loaded_chunks(retriever_module, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(project / "private_config.py", "def private_config():\n    return 123\n")
+    r = retriever_module.MultiLangCodeRetriever(project, tmp_path / "cache")
+    assert r.is_current()
+    (project / ".gitignore").write_text("private_config.py\n", encoding="utf-8")
+    assert not r.is_current()
+    assert not r._iter_indexable_files()
+    assert "private_config.py" not in r.search("private_config")
+    r.cache.close()
