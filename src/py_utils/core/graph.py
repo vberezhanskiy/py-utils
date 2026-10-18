@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -25,6 +26,7 @@ from typing import Optional
 from ..ignore import ProjectIgnore
 import json5
 
+from .db import _SQLITE_BUSY_TIMEOUT_MS, _ClosingConnection, _connect  # noqa: F401
 from .embedder import encode_batch_size, encode_documents, encode_query
 from .graph_analysis import GraphAnalysisMixin
 from .graph_text import GraphTextMixin
@@ -459,44 +461,6 @@ _TRAIT_PATTERNS_UNIVERSAL: list[tuple[str, re.Pattern]] = [
 ]
 
 
-_SQLITE_BUSY_TIMEOUT_MS = 30_000
-
-
-class _ClosingConnection(sqlite3.Connection):
-    """``with`` завершает транзакцию И закрывает соединение.
-
-    У обычного sqlite3.Connection выход из ``with`` только фиксирует или
-    откатывает транзакцию, а соединение остаётся открытым до сборщика мусора.
-    Сайдкар живёт всё время работы приложения, и каждый запрос к графу
-    оставлял за собой открытый файл базы и WAL.
-    """
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            return super().__exit__(exc_type, exc, tb)
-        finally:
-            self.close()
-
-
-def _connect(db_path) -> sqlite3.Connection:
-    """Соединение с графом; ``with _connect(...)`` закрывает его на выходе.
-
-    WAL и busy_timeout не выставлялись нигде, поэтому действовал
-    rollback-journal и пятисекундное ожидание: полная пересборка делает VACUUM
-    под эксклюзивной блокировкой всей базы, и параллельные чтения падали с
-    «database is locked» — интерфейс получал голый 500, а записи билдера
-    возвращали модели ошибку, и файл молча оставался неиндексированным.
-    """
-    con = sqlite3.connect(db_path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000, factory=_ClosingConnection)
-    con.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
-    try:
-        con.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.DatabaseError:
-        # Сетевые тома WAL не поддерживают — остаёмся на журнале по умолчанию.
-        pass
-    return con
-
-
 # Файлы, содержимое которых не покидает машину.
 #
 # Промпт билдера прямо велит расписывать .env по переменным, а обогащение
@@ -540,6 +504,11 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # Индекс и имена — одно неделимое состояние: по отдельности они
         # рассинхронизируются, и поиск начинает возвращать чужие сущности.
         self._faiss: tuple[object | None, list[str]] = (None, [])
+        # Пересборки FAISS идут по одной. Параллельные (поиски сразу после
+        # старта, index_file по нескольким файлам) кодировали весь граф каждая,
+        # а та, что начала раньше со старыми строками, публиковала свой индекс
+        # позже и молча затирала свежий — при уже снятом флаге «грязный».
+        self._faiss_lock = threading.Lock()
         self._is_building = False
         # Set when reindex_file runs without an immediate FAISS rebuild
         # (e.g. from the file-system watcher). Similarity tools check this
@@ -623,6 +592,20 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             if "traits" not in columns:
                 con.execute("ALTER TABLE entities ADD COLUMN traits TEXT DEFAULT ''")
                 con.execute("CREATE INDEX IF NOT EXISTS idx_entities_traits ON entities(traits)")
+            # Оба писателя (этот и Node-воркер) для файлов с секретами хранят
+            # только имя и координаты, но базы, собранные до этой чистки, ещё
+            # держат «KEY=значение» в snippet и description. Их читают все:
+            # search_entity, похожие сущности, Node-тулы графа напрямую.
+            con.create_function(
+                "py_utils_is_secret", 1, lambda f: int(_is_secret_file(f or "")), deterministic=True,
+            )
+            purged = con.execute(
+                "UPDATE entities SET description = '', snippet = '' "
+                "WHERE (COALESCE(description, '') != '' OR COALESCE(snippet, '') != '') "
+                "AND py_utils_is_secret(file)"
+            ).rowcount
+            if purged:
+                logger.info("Cleared stored contents of %d entities from secret files.", purged)
             # Run trait back-fill independently of the ALTER above so the
             # upgrade also lights up for users whose prior session added
             # the column but didn't have the back-fill code yet.
@@ -677,7 +660,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # the filename, and _IGNORE_DIRS contains names like ".env"/"env"
         # that are also legitimate FILE names (a project's .env file must not
         # be ignored because a directory of the same name would be).
-        parts = set(path.parts[:-1]) if path.parts else set()
+        # Only the components INSIDE the project: an absolute path also carries
+        # the folders above the root, and a project at D:\temp\app or
+        # ~/work/build/site dropped out of the graph entirely — "temp" and
+        # "build" are on the list.
+        try:
+            inside = Path(os.path.abspath(self.project_root / path)).relative_to(self.project_root)
+        except ValueError:
+            return True
+        parts = set(inside.parts[:-1])
         if parts & _IGNORE_DIRS:
             return True
         if self._extra_ignore_dirs and (parts & self._extra_ignore_dirs):
@@ -729,7 +720,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
 
     def _file_needs_update(self, filepath: Path) -> bool:
         rel = filepath.relative_to(self.project_root).as_posix()
-        mtime = filepath.stat().st_mtime
+        try:
+            mtime = filepath.stat().st_mtime
+        except OSError:
+            # Файл удалили между обходом и этой проверкой. Исключение роняло
+            # /graph/pending_files и весь build (gather отдаёт первое же);
+            # «устаревший» безвреден — следующий обход увидит его удалённым.
+            return True
         with _connect(self.db_path) as con:
             row = con.execute(
                 "SELECT mtime FROM file_meta WHERE file = ?", (rel,)
@@ -2221,15 +2218,24 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         """
         if not self._faiss_dirty and self.faiss_index is not None:
             return
-        try:
-            with _connect(self.db_path) as con:
-                n = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-        except Exception:
+        # Индекс есть, и его уже пересобирает соседний поток — отвечаем по
+        # текущему, а не ждём кодировщика минутами. Индекса нет — ждём.
+        if not self._faiss_lock.acquire(blocking=self.faiss_index is None):
             return
-        if n:
-            self._rebuild_faiss()
-        else:
-            self._faiss_dirty = False
+        try:
+            if not self._faiss_dirty and self.faiss_index is not None:
+                return  # собран, пока ждали
+            try:
+                with _connect(self.db_path) as con:
+                    n = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+            except Exception:
+                return
+            if n:
+                self._rebuild_faiss_locked()
+            else:
+                self._faiss_dirty = False
+        finally:
+            self._faiss_lock.release()
 
     @property
     def faiss_index(self):
@@ -2248,6 +2254,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         return self._faiss
 
     def _rebuild_faiss(self) -> None:
+        with self._faiss_lock:
+            self._rebuild_faiss_locked()
+
+    def _rebuild_faiss_locked(self) -> None:
         self._faiss_dirty = False
         try:
             import faiss
@@ -2422,14 +2432,18 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
                 lines.append(f"      {snippet_line}")
         return lines
     def _find_entity_snippet(self, rel_path: str, entity_name: str) -> dict:
+        # Форма ответа одна на все исходы: вызывающие берут ключи напрямую, и
+        # пустой {} для файла, ставшего симлинком наружу, ронял search_entity
+        # с KeyError.
+        empty = {"line_start": None, "line_end": None, "snippet": ""}
         try:
             path = self._resolve_project_file(rel_path)
-        except ValueError:
-            return {}
+        except (ValueError, OSError):
+            return empty
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
-            return {"line_start": None, "line_end": None, "snippet": ""}
+            return empty
         lines = text.splitlines()
         if not lines:
             return {"line_start": None, "line_end": None, "snippet": ""}
@@ -2473,12 +2487,15 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             if match_index is not None:
                 break
         if match_index is None:
-            return {"line_start": None, "line_end": None, "snippet": ""}
+            return empty
         # Anchor line_start to the matched definition line itself; keep a
         # couple of leading lines only for snippet context.
         start = max(0, match_index - 2)
         end = min(len(lines), match_index + 3)
-        snippet = "\n".join(lines[start:end]).strip()
+        # Из файла с секретами — только координаты. Писатели графа сниппет
+        # для них вычищают, но search_entity при пустом сниппете досказывал
+        # его отсюда, с диска, и «KEY=значение» уходило в /search_code.
+        snippet = "" if _is_secret_file(rel_path) else "\n".join(lines[start:end]).strip()
         return {"line_start": match_index + 1, "line_end": end, "snippet": snippet}
 
     def _search_raw_occurrences(self, query: str, limit: int = 10) -> list[dict]:
@@ -2489,7 +2506,13 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         lowered = normalized.lower()
         for path in self._get_files():
             rel_path = path.relative_to(self.project_root).as_posix()
+            # Тот же отбор, что у FTS-индекса: .env и ключи в список
+            # индексируемых входят, и сырой поиск отдавал их строки целиком.
+            if _is_secret_file(rel_path):
+                continue
             try:
+                if path.stat().st_size > self._max_file_bytes:
+                    continue
                 text = path.read_text(encoding="utf-8", errors="ignore")
             except Exception:
                 continue
@@ -2813,13 +2836,12 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # it can't run inside a transaction, so we open a separate
         # autocommit connection.
         try:
-            con = sqlite3.connect(self.db_path, isolation_level=None)
-            try:
+            with _connect(self.db_path) as con:
+                con.isolation_level = None
                 con.execute("VACUUM")
-            finally:
-                con.close()
         except Exception as e:
             logger.warning("VACUUM after clear failed: %s", e)
-        self._faiss = (None, [])
-        self._faiss_dirty = False
+        with self._faiss_lock:
+            self._faiss = (None, [])
+            self._faiss_dirty = False
         logger.info("Code graph cleared")

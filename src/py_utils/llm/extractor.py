@@ -149,7 +149,7 @@ class OpenAICompatExtractor:
             )
             logger.warning("LLM extract for %s returned empty response", rel_path)
             return {"entities": [], "relations": []}
-        result = _parse_json_lenient(_strip_code_fence(text), context=rel_path)
+        result = _as_graph(_parse_json_lenient(_strip_code_fence(text), context=rel_path))
         # Empty result with a non-empty response usually means the model
         # produced prose / a code block / a different schema — log a preview
         # so users can adjust the prompt or model.
@@ -231,6 +231,23 @@ def _parse_json_lenient(text: str, context: str = "") -> dict:
             context or "<unknown>", first_err, e, text[:300],
         )
         return {"entities": [], "relations": []}
+
+
+def _as_graph(parsed) -> dict:
+    """Ответ модели — к форме {"entities": [...], "relations": [...]}.
+
+    Валидный JSON не обязательно объект графа: ``[]``, ``null`` или строка
+    роняли extract() на ``result.get`` (AttributeError вместо пустого
+    результата), а ``"entities": 5`` уходило дальше и падало уже при записи.
+    """
+    if not isinstance(parsed, dict):
+        return {"entities": [], "relations": []}
+    entities = parsed.get("entities")
+    relations = parsed.get("relations")
+    return {
+        "entities": entities if isinstance(entities, list) else [],
+        "relations": relations if isinstance(relations, list) else [],
+    }
 
 
 def _env_int(name: str, default: int) -> int:

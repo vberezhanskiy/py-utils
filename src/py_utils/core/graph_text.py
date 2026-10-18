@@ -14,7 +14,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from ..paths import is_secret_file as _is_secret_file
+from .db import _connect
+from ..paths import is_secret_file as _is_secret_file, resolve_inside_project
 
 
 logger = logging.getLogger(__name__)
@@ -70,21 +71,13 @@ class GraphTextMixin:
         once and then never refreshed — the early return on a non-empty table
         kept serving chunks of files that had since changed.
         """
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             if not self._ensure_text_table(con):
                 return 0
-            if force:
-                # Plain DELETE, not the FTS5 'delete-all' command: the latter is
-                # rejected on a content-owning table like this one, and it fails
-                # by raising — leaving stale chunks in place while fresh ones
-                # pile up on top. DELETE also avoids the full-database rewrite
-                # that DROP + VACUUM would cost on every rebuild.
-                con.execute("DELETE FROM chunks_fts")
-            else:
+            if not force:
                 count = con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
                 if count > 0:
                     return count
-            con.commit()
 
         chunks: list[tuple[str, str, int]] = []
         chunk_lines = 100
@@ -109,13 +102,27 @@ class GraphTextMixin:
                 if chunk.strip():
                     chunks.append((chunk, rel, i + 1))
 
-        if chunks:
-            with sqlite3.connect(self.db_path) as con:
-                con.executemany(
-                    "INSERT INTO chunks_fts(content, file, line_start) VALUES (?,?,?)",
-                    chunks,
-                )
-                con.commit()
+        # Старые куски стираются в той же транзакции, что пишет новые, и
+        # только после чтения файлов. Раньше DELETE фиксировался до обхода
+        # проекта: всё это время таблица была пустой, и Node-воркер, читающий
+        # её напрямую, объявлял мёртвым любой код. А два построения на пустой
+        # таблице оба вставляли куски — выдача regex-поиска удваивалась.
+        with _connect(self.db_path) as con:
+            con.execute("BEGIN IMMEDIATE")
+            if not force:
+                count = con.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+                if count > 0:
+                    return count  # соседнее построение успело раньше
+            # Plain DELETE, not the FTS5 'delete-all' command: the latter is
+            # rejected on a content-owning table like this one, and it fails
+            # by raising — leaving stale chunks in place while fresh ones
+            # pile up on top. DELETE also avoids the full-database rewrite
+            # that DROP + VACUUM would cost on every rebuild.
+            con.execute("DELETE FROM chunks_fts")
+            con.executemany(
+                "INSERT INTO chunks_fts(content, file, line_start) VALUES (?,?,?)",
+                chunks,
+            )
         logger.info("FTS5 trigram chunk index built: %d chunks", len(chunks))
         return len(chunks)
 
@@ -171,7 +178,7 @@ class GraphTextMixin:
             return {"matches": [], "warning": f"Invalid regex: {e}"}
 
         matches: list[dict] = []
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             try:
                 cursor = con.execute(
                     "SELECT file, line_start, content FROM chunks_fts "
@@ -213,7 +220,7 @@ class GraphTextMixin:
 
     def text_index_clear(self) -> None:
         """Drop the FTS5 trigram index (forces a rebuild on next call)."""
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             try:
                 con.execute("DROP TABLE IF EXISTS chunks_fts")
                 con.execute("VACUUM")
@@ -269,7 +276,12 @@ class GraphTextMixin:
             cmd.extend(["--lang", lang])
         target = self.project_root
         if path_filter:
-            target = self.project_root / path_filter
+            # Без сверки ``..`` или абсолютный путь отправляли ast-grep искать
+            # по любому каталогу диска, а найденный код уходил модели.
+            try:
+                target = resolve_inside_project(self.project_root, path_filter)
+            except (ValueError, OSError):
+                return {"matches": [], "warning": f"path_filter is outside the project: {path_filter}"}
             if not target.exists():
                 return {"matches": [], "warning": f"path_filter not found: {path_filter}"}
         cmd.append(str(target))
@@ -300,10 +312,15 @@ class GraphTextMixin:
             except json.JSONDecodeError:
                 continue
             file_path = rec.get("file") or ""
+            # ast-grep идёт по симлинкам и не знает про секретные файлы:
+            # совпадение вне проекта или из credentials.json не отдаём.
             try:
-                rel = Path(file_path).resolve().relative_to(self.project_root).as_posix()
+                resolved = Path(file_path).resolve()
+                rel = resolved.relative_to(self.project_root).as_posix()
             except (ValueError, OSError):
-                rel = file_path
+                continue
+            if _is_secret_file(rel) or self._should_ignore(resolved):
+                continue
             r = rec.get("range") or {}
             start = (r.get("start") or {}).get("line", 0) + 1
             end = (r.get("end") or {}).get("line", 0) + 1

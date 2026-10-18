@@ -107,7 +107,9 @@ class ProjectConfig:
         if not toml_path.is_file():
             return cls()
         try:
-            data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+            # utf-8-sig: PowerShell 5.1 и старый Блокнот пишут BOM, а tomllib
+            # на нём падает — настройки проекта молча пропадали.
+            data = tomllib.loads(toml_path.read_text(encoding="utf-8-sig"))
         except Exception as exc:
             logger.warning("Could not parse %s: %s", toml_path, exc)
             return cls()

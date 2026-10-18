@@ -110,8 +110,14 @@ class MultiLangCodeRetriever:
                 return True
         # Exact-match against path components — substring check would filter
         # files like Layout.tsx/Login.tsx because their parent dir contains
-        # "out"/"log" as substring.
-        parts = {p.lower() for p in path.parts}
+        # "out"/"log" as substring. Only the components inside the project:
+        # the folders above the root (C:\Release\app, ~/build/site) used to
+        # empty the whole index.
+        try:
+            inside = Path(os.path.abspath(self.root_dir / path)).relative_to(self.root_dir)
+        except ValueError:
+            return True
+        parts = {p.lower() for p in inside.parts}
         return bool(parts & self._ignore_dirs())
 
     def _should_ignore_dir(self, name: str) -> bool:
@@ -303,6 +309,15 @@ class MultiLangCodeRetriever:
         # dimension and fail the next encode/search).
         h.update(f"{self.chunk_size}:{self.overlap}:{_embed_model_id()}".encode())
         return h.hexdigest()
+
+    def close(self) -> None:
+        """Закрыть diskcache индекса; повторный вызов безопасен.
+
+        Сайдкар закрывает вытесненный и устаревший ретривер через ``close()``,
+        а метода не было: открытая база уходила вместе с объектом, и на
+        Windows каталог кэша нельзя было ни удалить, ни переименовать.
+        """
+        self.cache.close()
 
     def rebuild(self) -> None:
         """Drop the cache and rebuild from scratch."""

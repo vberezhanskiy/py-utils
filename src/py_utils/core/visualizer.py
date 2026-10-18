@@ -16,11 +16,13 @@ apart from the vis-network CDN script.
 
 from __future__ import annotations
 
+import html
 import json
-import sqlite3
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
+
+from .db import _connect
 
 
 # ────────────────── data shaping ──────────────────
@@ -48,7 +50,7 @@ def build_visualization_data(
         "stats":         {modules, files, relations}
       }
     """
-    with sqlite3.connect(db_path) as con:
+    with _connect(db_path) as con:
         relations = con.execute(
             "SELECT file, from_name, relation, to_name FROM relations"
         ).fetchall()
@@ -356,7 +358,7 @@ function renderFileSide(filePath) {
     html += '<ul>';
     for (const e of info.primary) {
       const c = TYPE_COLOR[e.t] || '#888';
-      html += '<li><span class="type" style="color:' + c + '">[' + e.t + ']</span> <b>' + escapeHtml(e.n) + '</b>';
+      html += '<li><span class="type" style="color:' + c + '">[' + escapeHtml(e.t) + ']</span> <b>' + escapeHtml(e.n) + '</b>';
       if (e.l) html += ' <span class="type">:' + e.l + '</span>';
       html += '</li>';
     }
@@ -425,7 +427,12 @@ renderModules();
 
 
 def render_html(data: dict, title: str) -> str:
+    # Имена сущностей, пути и тип пишет модель по чужому коду. JSON внутри
+    # <script> без экранирования закрывался строкой «</script>» в любом имени,
+    # и дальше шла разметка из исходников; заголовок — имя папки проекта.
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    payload = payload.replace("<", r"\u003c").replace(">", r"\u003e").replace("&", r"\u0026")
     return _HTML_TEMPLATE % {
-        "title": title,
-        "data": json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        "title": html.escape(title),
+        "data": payload,
     }

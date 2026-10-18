@@ -42,3 +42,26 @@ def test_ошибка_откатывает_и_тоже_закрывает(tmp_pa
         con.execute("SELECT 1")
     with graph._connect(db) as again:
         assert again.execute("SELECT count(*) FROM t").fetchone() == (0,)
+
+
+def test_ожидание_блокировки_и_wal_выставлены(tmp_path):
+    with graph._connect(tmp_path / "graph.db") as con:
+        assert con.execute("PRAGMA busy_timeout").fetchone() == (30_000,)
+        assert con.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+
+
+def test_все_модули_открывают_базу_только_через_общий_connect():
+    # Миксины поиска и анализа и визуализатор открывали graph.db голым
+    # sqlite3.connect: без WAL, с пятисекундным ожиданием и без закрытия.
+    # Пока сборка держала запись, их чтения падали с «database is locked».
+    from pathlib import Path
+
+    import py_utils
+
+    package = Path(py_utils.__file__).parent
+    offenders = sorted(
+        str(path.relative_to(package))
+        for path in package.rglob("*.py")
+        if path.name != "db.py" and "sqlite3.connect(" in path.read_text(encoding="utf-8")
+    )
+    assert offenders == []

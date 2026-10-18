@@ -99,3 +99,16 @@ def test_ignore_change_invalidates_cache_and_filters_loaded_chunks(retriever_mod
     assert not r._iter_indexable_files()
     assert "private_config.py" not in r.search("private_config")
     r.cache.close()
+
+
+def test_close_releases_disk_cache(retriever_module, tmp_path):
+    # Сайдкар закрывает вытесненный и устаревший ретривер через close();
+    # метода не было, и открытый diskcache уходил вместе с объектом.
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(project / "app.py", "def handler(request):\n    return request.user\n")
+    retriever = retriever_module.MultiLangCodeRetriever(project, tmp_path / "cache")
+    retriever.close()
+    retriever.close()  # повторное закрытие безопасно
+    import shutil
+    shutil.rmtree(tmp_path / "cache")  # на Windows открытая база не даёт удалить каталог

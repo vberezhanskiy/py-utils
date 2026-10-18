@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 from collections import defaultdict
 from typing import Optional
+
+from .db import _connect
 
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ class GraphAnalysisMixin:
         # filter set AND whose description marks a real declaration ("Extracted
         # from <node>") over a regex sweep ("Referenced call target").
         primary_marker = ",".join("?" * len(type_filter)) if type_filter else "''"
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             row = con.execute(
                 f"""
                 SELECT file, name, description, snippet, type FROM entities
@@ -133,7 +134,7 @@ class GraphAnalysisMixin:
 
         seen: set[tuple[str, str]] = set()
         results: list[dict] = []
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             for score, idx in zip(scores[0], indices[0]):
                 if idx < 0 or score < min_score:
                     continue
@@ -233,7 +234,7 @@ class GraphAnalysisMixin:
         if filter_angular:
             over_fetch *= 4
         sql_limit = max(limit, over_fetch)
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 f"""
                 SELECT e.file, e.name, e.type, e.description, e.line_start, e.line_end, e.snippet
@@ -404,7 +405,7 @@ class GraphAnalysisMixin:
 
         types = set(entity_types) if entity_types else set(self._PRIMARY_DEF_TYPES)
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             all_entities = con.execute(
                 "SELECT file, name, type, line_start, line_end FROM entities ORDER BY id"
             ).fetchall()
@@ -535,7 +536,7 @@ class GraphAnalysisMixin:
         """
         globs = tuple(test_globs) if test_globs else self._DEFAULT_TEST_GLOBS
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             file_rows = con.execute("SELECT DISTINCT file FROM entities").fetchall()
             ent_rows = con.execute(
                 "SELECT file, name, type, line_start FROM entities "
@@ -642,7 +643,7 @@ class GraphAnalysisMixin:
         if path_filter:
             where += " AND file LIKE ?"
             params.append(f"%{path_filter}%")
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             rows = con.execute(
                 f"SELECT file, name, type, line_start, line_end, traits FROM entities "
                 f"WHERE {where} ORDER BY file, line_start LIMIT ?",
@@ -678,7 +679,7 @@ class GraphAnalysisMixin:
                 "selected_count": 0,
             }
 
-        with sqlite3.connect(self.db_path) as con:
+        with _connect(self.db_path) as con:
             # Only include entities that have a `defines` edge from their
             # own file. This drops the "phantom" rows that the symbol-relation
             # extractor inserts whenever a file *references* a name (JSX tags,
