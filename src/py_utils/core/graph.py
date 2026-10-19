@@ -41,6 +41,25 @@ from ..paths import (
 logger = logging.getLogger(__name__)
 
 
+# Файлы, у которых полная запись ждёт входящих рёбер (обратного grep), и для
+# которых запись с сущностями без связей отклоняется (правило R3): код,
+# разметка с поведением (Angular .html, Vue, Svelte) и стили. Тот же список —
+# в ядре: agent-worker/src/tools/graph-contract.ts; векторы —
+# tests/test_graph_core_contract.py, меняются только вместе.
+INCOMING_GATE_EXTENSIONS = frozenset({
+    ".py", ".pyi",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".kt", ".scala",
+    ".cs", ".cpp", ".cc", ".c", ".h", ".hpp",
+    ".rb", ".php", ".swift",
+    ".html", ".vue", ".svelte",
+    ".css", ".scss", ".sass", ".less",
+})
+
+# Насколько время файла на диске может отличаться от записи в file_meta и
+# считаться тем же: Node и Python округляют время по-разному.
+MTIME_TOLERANCE_SECONDS = 1e-3
+
 _ALLOWED_ENTITY_TYPES = {
     "class", "function", "method", "import", "module", "interface", "component",
     "hook", "type", "enum", "selector", "style", "template", "config", "variable", "symbol", "property",
@@ -731,7 +750,10 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
             row = con.execute(
                 "SELECT mtime FROM file_meta WHERE file = ?", (rel,)
             ).fetchone()
-        return row is None or row[0] != mtime
+        # С допуском, а не побитово: ядро пишет ``mtimeMs / 1000`` из Node, и
+        # округление расходится со ``st_mtime`` в последнем бите — такой файл
+        # навсегда считался устаревшим (tests/test_graph_core_contract.py).
+        return row is None or abs(row[0] - mtime) > MTIME_TOLERANCE_SECONDS
 
     def _delete_file_data(self, rel_path: str) -> None:
         with _connect(self.db_path) as con:
@@ -1441,21 +1463,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # emit them. Non-code assets (.html/.css/.json/.md) are exempt.
         # Reverse-grep writes (entities=[], relations=[...]) are also exempt
         # — that branch is handled below by the additive guard.
-        _CODE_EXTS = {
-            ".py", ".pyi",
-            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-            ".go", ".rs", ".java", ".kt", ".scala",
-            ".cs", ".cpp", ".cc", ".c", ".h", ".hpp",
-            ".rb", ".php", ".swift",
-            # Templates with behaviour: Angular .html has (click)/[binding]
-            # handlers and <component-selector> references, Vue/Svelte
-            # carry script + template + event handlers in one file.
-            ".html", ".vue", ".svelte",
-            # Stylesheets: their selectors/variables are referenced from
-            # markup and other stylesheets — reverse-grep incoming edges
-            # (styleUrls, @import, class usage) apply the same way.
-            ".css", ".scss", ".sass", ".less",
-        }
+        _CODE_EXTS = INCOMING_GATE_EXTENSIONS
         # A "module-only" write carries just the file's own entity (name ==
         # relpath) and nothing else — the sanctioned way to register a
         # machine-generated code file (minified bundle, migration snapshot)
@@ -1558,8 +1566,7 @@ class CodeGraph(GraphAnalysisMixin, GraphTextMixin):
         # The reverse-grep gate covers stylesheets too: "who imports/uses
         # this .scss" is a real incoming edge (component styleUrls, @import
         # chains) even though R3 doesn't demand outgoing relations for them.
-        _GATE_EXTS = _CODE_EXTS | {".css", ".scss", ".sass", ".less"}
-        code_ext = filepath.suffix.lower() in _GATE_EXTS
+        code_ext = filepath.suffix.lower() in INCOMING_GATE_EXTENSIONS
         flag_ignored = False
         if entities and code_ext and not module_only:
             # HARD GATE: ``incoming_complete=True`` on the INITIAL full write
