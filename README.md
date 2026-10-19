@@ -1,5 +1,11 @@
 **English** · [Русский](README.ru.md)
 
+> **Moved on 2026-10-19** into the Paragon Agent monorepo (`agent-python`, folder `rag_service/engine`) with its
+> history. This repository is an archive only: no new commits land here.
+>
+> **Переехал 19.10.2026** в монорепо Paragon Agent (`agent-python`, папка `rag_service/engine`) с историей. Этот
+> репозиторий — только архив: новые коммиты сюда не идут.
+
 # py-utils
 
 A self-hosted MCP server that turns any source tree into a **code knowledge graph** plus **hybrid semantic + lexical search** + an **interactive HTML visualization**. Designed for Claude Code, but speaks plain MCP so any MCP-aware client (Cursor, Continue, custom agents) can plug in.
