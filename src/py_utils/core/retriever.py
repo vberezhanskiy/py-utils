@@ -90,10 +90,13 @@ class MultiLangCodeRetriever:
 
     @staticmethod
     def _ignore_dirs() -> set[str]:
+        # В нижнем регистре: и обход, и фильтр выдачи сравнивают имя в нижнем
+        # регистре. CMakeFiles, Debug и Release в списке с заглавной фильтр
+        # не находил никогда, а обход пропускал node_modules только так.
         return {
             "node_modules", "venv", ".venv", "__pycache__", ".git", ".pytest_cache",
             "dist", "build", "logs", ".idea", ".vscode", "target", "bin", "obj",
-            ".gradle", "vendor", "CMakeFiles", "Debug", "Release", ".angular",
+            ".gradle", "vendor", "cmakefiles", "debug", "release", ".angular",
         }
 
     def _should_ignore(self, path: Path) -> bool:
@@ -121,7 +124,7 @@ class MultiLangCodeRetriever:
         return bool(parts & self._ignore_dirs())
 
     def _should_ignore_dir(self, name: str) -> bool:
-        return name in self._ignore_dirs()
+        return name.lower() in self._ignore_dirs()
 
     def _iter_indexable_files(self) -> List[Path]:
         files: list[Path] = []
