@@ -32,7 +32,6 @@ from .graph_analysis import GraphAnalysisMixin
 from .graph_text import GraphTextMixin
 from ..llm.extractor import LLMExtractor, NoOpExtractor
 from ..paths import (
-    SECRET_FILE_PATTERNS,
     is_inside_project,
     is_secret_file,
     resolve_inside_project,
@@ -492,7 +491,6 @@ _TRAIT_PATTERNS_UNIVERSAL: list[tuple[str, re.Pattern]] = [
 # (graph_text) и ретриверу, а три копии одного перечня — верный способ однажды
 # закрыть файл в одном месте и оставить открытым в двух других. Псевдонимы
 # оставлены, чтобы не трогать обращения по всему модулю.
-_SECRET_FILE_PATTERNS = SECRET_FILE_PATTERNS
 _is_secret_file = is_secret_file
 
 
